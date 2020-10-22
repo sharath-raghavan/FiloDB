@@ -221,6 +221,49 @@ extends ColumnStore with CassandraChunkSource with StrictLogging {
     }
   }
 
+  def copyOrDeletePartitionKeysByTimeRange(datasetRef: DatasetRef,
+                                           shard: Int,
+                                           splits: Iterator[ScanSplit],
+                                           startTime: Long,
+                                           endTime: Long,
+                                           target: CassandraColumnStore,
+                                           targetDatasetRef: DatasetRef,
+                                           diskTimeToLiveSeconds: Int): Unit = {
+    val sourcePartitionKeysTable = getOrCreatePartitionKeysTable(datasetRef, shard)
+    val targetPartitionKeysTable = target.getOrCreatePartitionKeysTable(targetDatasetRef, shard)
+
+    def compareAndGet(sourceRec: PartKeyRecord, targetRec: PartKeyRecord): PartKeyRecord = {
+      // compare and get the oldest start time
+      val startTime =
+        if (sourceRec.startTime <= targetRec.startTime) sourceRec.startTime else targetRec.startTime
+      // compare and get the latest end time
+      val endTime =
+        if (sourceRec.endTime >= targetRec.endTime) sourceRec.endTime else targetRec.endTime
+
+      PartKeyRecord(sourceRec.partKey, startTime, endTime, None)
+    }
+
+    for (split <- splits) {
+      val tokens = split.asInstanceOf[CassandraTokenRangeSplit].tokens
+      val rows = sourcePartitionKeysTable.scanRowsByTimeNoAsync(tokens, startTime, endTime)
+
+      for (row <- rows) {
+        val partKeyRecord = PartitionKeysTable.rowToPartKeyRecord(row)
+
+        if (diskTimeToLiveSeconds == 0) {
+          targetPartitionKeysTable.deletePartKey(partKeyRecord.partKey, shard)
+        } else {
+          targetPartitionKeysTable.readPartKey(partKeyRecord.partKey) match {
+            case Some(targetPkr) =>
+              targetPartitionKeysTable.writePartKey(compareAndGet(partKeyRecord, targetPkr), diskTimeToLiveSeconds)
+            case None =>
+              targetPartitionKeysTable.writePartKey(partKeyRecord, diskTimeToLiveSeconds)
+          }
+        }
+      }
+    }
+  }
+
   /**
     * Copy a range of chunks to a target ColumnStore, for performing disaster recovery or
     * backfills. This method can also be used to delete chunks, by specifying a ttl of zero.
