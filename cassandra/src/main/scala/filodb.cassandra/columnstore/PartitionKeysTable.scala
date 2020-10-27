@@ -46,7 +46,7 @@ sealed class PartitionKeysTable(val dataset: DatasetRef,
     s"WHERE TOKEN(partKey) >= ? AND TOKEN(partKey) < ?")
     .setConsistencyLevel(ConsistencyLevel.ONE)
 
-  private lazy val scanCql1 = session.prepare(
+  private lazy val scanCqlWithStartEndTime = session.prepare(
     s"SELECT partKey, startTime, endTime FROM $tableString " +
       s"WHERE TOKEN(partKey) >= ? AND TOKEN(partKey) < ? AND startTime >= ? AND endTime <= ? " +
       s"ALLOW FILTERING")
@@ -98,7 +98,7 @@ sealed class PartitionKeysTable(val dataset: DatasetRef,
        * Long based tokens. If other partitioners are used, this can potentially break.
        * Correct way is to pass Token objects around and bind tokens with stmt.bind().setPartitionKeyToken(token)
        */
-      val stmt = scanCql1.bind(start.toLong: java.lang.Long,
+      val stmt = scanCqlWithStartEndTime.bind(start.toLong: java.lang.Long,
         end.toLong: java.lang.Long,
         startTime: java.lang.Long,
         endTime: java.lang.Long)
@@ -115,7 +115,7 @@ sealed class PartitionKeysTable(val dataset: DatasetRef,
     }
   }
 
-  def deletePartKey(pk: Array[Byte], shard: Int): Future[Response] = {
+  def deletePartKey(pk: Array[Byte]): Future[Response] = {
     val  stmt = deleteCql.bind().setBytes(0, toBuffer(pk)).setConsistencyLevel(writeConsistencyLevel)
     connector.execStmtWithRetries(stmt)
   }

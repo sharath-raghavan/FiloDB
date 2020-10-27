@@ -8,7 +8,7 @@ import scala.collection.mutable.ArrayBuffer
 import scala.concurrent.{Await, ExecutionContext, Future}
 import scala.concurrent.duration._
 
-import com.datastax.driver.core.{ConsistencyLevel, Metadata, Session, TokenRange}
+import com.datastax.driver.core.{ConsistencyLevel, Metadata, Row, Session, TokenRange}
 import com.googlecode.concurrentlinkedhashmap.ConcurrentLinkedHashMap
 import com.typesafe.config.Config
 import com.typesafe.scalalogging.StrictLogging
@@ -222,16 +222,13 @@ extends ColumnStore with CassandraChunkSource with StrictLogging {
   }
 
   def copyOrDeletePartitionKeysByTimeRange(datasetRef: DatasetRef,
-                                           shard: Int,
+                                           numOfShards: Int,
                                            splits: Iterator[ScanSplit],
                                            startTime: Long,
                                            endTime: Long,
                                            target: CassandraColumnStore,
                                            targetDatasetRef: DatasetRef,
                                            diskTimeToLiveSeconds: Int): Unit = {
-    val sourcePartitionKeysTable = getOrCreatePartitionKeysTable(datasetRef, shard)
-    val targetPartitionKeysTable = target.getOrCreatePartitionKeysTable(targetDatasetRef, shard)
-
     def compareAndGet(sourceRec: PartKeyRecord, targetRec: PartKeyRecord): PartKeyRecord = {
       // compare and get the oldest start time
       val startTime =
@@ -243,15 +240,12 @@ extends ColumnStore with CassandraChunkSource with StrictLogging {
       PartKeyRecord(sourceRec.partKey, startTime, endTime, None)
     }
 
-    for (split <- splits) {
-      val tokens = split.asInstanceOf[CassandraTokenRangeSplit].tokens
-      val rows = sourcePartitionKeysTable.scanRowsByTimeNoAsync(tokens, startTime, endTime)
-
+    def copyRows(targetPartitionKeysTable: PartitionKeysTable, rows: Iterator[Row]) = {
       for (row <- rows) {
         val partKeyRecord = PartitionKeysTable.rowToPartKeyRecord(row)
 
         if (diskTimeToLiveSeconds == 0) {
-          targetPartitionKeysTable.deletePartKey(partKeyRecord.partKey, shard)
+          targetPartitionKeysTable.deletePartKey(partKeyRecord.partKey)
         } else {
           targetPartitionKeysTable.readPartKey(partKeyRecord.partKey) match {
             case Some(targetPkr) =>
@@ -260,6 +254,16 @@ extends ColumnStore with CassandraChunkSource with StrictLogging {
               targetPartitionKeysTable.writePartKey(partKeyRecord, diskTimeToLiveSeconds)
           }
         }
+      }
+    }
+
+    for (split <- splits) {
+      for (shard <- 0 until numOfShards) {
+        val tokens = split.asInstanceOf[CassandraTokenRangeSplit].tokens
+        val sourcePartitionKeysTable = getOrCreatePartitionKeysTable(datasetRef, shard)
+        val targetPartitionKeysTable = target.getOrCreatePartitionKeysTable(targetDatasetRef, shard)
+        val rows = sourcePartitionKeysTable.scanRowsByTimeNoAsync(tokens, startTime, endTime)
+        copyRows(targetPartitionKeysTable, rows)
       }
     }
   }
@@ -445,7 +449,7 @@ extends ColumnStore with CassandraChunkSource with StrictLogging {
                      pks: Observable[Array[Byte]]): Future[Long] = {
     val pkTable = getOrCreatePartitionKeysTable(ref, shard)
     pks.mapAsync(writeParallelism) { pk =>
-      Task.fromFuture(pkTable.deletePartKey(pk, shard))
+      Task.fromFuture(pkTable.deletePartKey(pk))
     }.countL.runAsync
   }
 

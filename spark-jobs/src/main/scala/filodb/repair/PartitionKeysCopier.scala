@@ -1,10 +1,12 @@
 package filodb.repair
 
 import java.io.File
+import java.lang
 import java.time.Instant
 import java.time.format.DateTimeFormatter
+import java.util
 
-import com.typesafe.config.ConfigFactory
+import com.typesafe.config.{Config, ConfigFactory}
 import com.typesafe.scalalogging.StrictLogging
 import monix.execution.Scheduler
 import org.apache.spark.SparkConf
@@ -21,6 +23,27 @@ class PartitionKeysCopier(conf: SparkConf) {
     val sysConfig = GlobalConfig.systemConfig.getConfig("filodb")
     ConfigFactory.parseFile(new File(conf.get(str))).getConfig("filodb").withFallback(sysConfig)
   }
+
+  def getShardNum: Int = {
+    def getConfig(path: lang.String): Config = {
+      ConfigFactory.parseFile(new File(path))
+    }
+
+    val sourceConfigPaths: util.List[lang.String] = sourceConfig.getStringList("dataset-configs")
+    val datasetConfig: Config = sourceConfigPaths.stream()
+      .map[Config](new util.function.Function[lang.String, Config]() {
+        override def apply(path: lang.String): Config = getConfig(path)
+      })
+      .filter(new util.function.Predicate[Config] {
+        override def test(conf: Config): Boolean = conf.getString("dataset").equals(sourceDataset)
+      })
+      .findFirst()
+      .orElseThrow()
+
+    val numShards = datasetConfig.getInt("num-shards")
+    numShards
+  }
+
   // Examples: 2019-10-20T12:34:56Z  or  2019-10-20T12:34:56-08:00
   private def parseDateTime(str: String) = Instant.from(DateTimeFormatter.ISO_OFFSET_DATE_TIME.parse(str))
 
@@ -30,11 +53,13 @@ class PartitionKeysCopier(conf: SparkConf) {
   private val targetConfig = openConfig("spark.filodb.partitionkeys.copier.target.configFile")
   private val sourceCassConfig = sourceConfig.getConfig("cassandra")
   private val targetCassConfig = targetConfig.getConfig("cassandra")
-  private val sourceDatasetRef = DatasetRef.fromDotString(conf.get("spark.filodb.partitionkeys.copier.source.dataset"))
+  private val sourceDataset = conf.get("spark.filodb.partitionkeys.copier.source.dataset")
+  private val sourceDatasetRef = DatasetRef.fromDotString(sourceDataset)
   private val targetDatasetRef = DatasetRef.fromDotString(conf.get("spark.filodb.partitionkeys.copier.target.dataset"))
   private val sourceSession = FiloSessionProvider.openSession(sourceCassConfig)
   private val targetSession = FiloSessionProvider.openSession(targetCassConfig)
 
+  private val numOfShards: Int = getShardNum
   private val ingestionTimeStart = parseDateTime(conf.get("spark.filodb.partitionkeys.copier.ingestionTimeStart"))
   private val ingestionTimeEnd = parseDateTime(conf.get("spark.filodb.partitionkeys.copier.ingestionTimeEnd"))
   private val diskTimeToLiveSeconds = conf.getTimeAsSeconds("spark.filodb.partitionkeys.copier.diskTimeToLive")
@@ -43,7 +68,6 @@ class PartitionKeysCopier(conf: SparkConf) {
 
   val sourceCassandraColStore = new CassandraColumnStore(sourceConfig, readSched, sourceSession)(writeSched)
   val targetCassandraColStore = new CassandraColumnStore(targetConfig, readSched, targetSession)(writeSched)
-  val shard: Int = 0 //TODO get the value from conf
 
   // Destructively deletes everything in the target before updating anthing. Is used when chunks aren't aligned.
   private[repair] val deleteFirst = conf.getBoolean("spark.filodb.partitionkeys.copier.deleteFirst", false)
@@ -57,7 +81,7 @@ class PartitionKeysCopier(conf: SparkConf) {
   def copySourceToTarget(splitIter: Iterator[ScanSplit]): Unit = {
     sourceCassandraColStore.copyOrDeletePartitionKeysByTimeRange(
       sourceDatasetRef,
-      shard,
+      numOfShards,
       splitIter,
       ingestionTimeStart.toEpochMilli(),
       ingestionTimeEnd.toEpochMilli(),
@@ -69,7 +93,7 @@ class PartitionKeysCopier(conf: SparkConf) {
   def deleteFromTarget(splitIter: Iterator[ScanSplit]): Unit = {
     targetCassandraColStore.copyOrDeletePartitionKeysByTimeRange(
       targetDatasetRef,
-      shard,
+      numOfShards,
       splitIter,
       ingestionTimeStart.toEpochMilli(),
       ingestionTimeEnd.toEpochMilli(),
