@@ -1,18 +1,10 @@
 package filodb.repair
 
 import java.io.File
+import java.time.Instant
+import java.time.format.DateTimeFormatter
 
 import com.typesafe.config.ConfigFactory
-import filodb.cassandra.DefaultFiloSessionProvider
-import filodb.cassandra.columnstore.CassandraColumnStore
-import filodb.core.GlobalConfig
-import filodb.core.binaryrecord2.RecordBuilder
-import filodb.core.downsample.OffHeapMemory
-import filodb.core.memstore.{TimeSeriesPartition, TimeSeriesShardStats}
-import filodb.core.metadata.{Dataset, Schema, Schemas}
-import filodb.core.store.{PartKeyRecord, StoreConfig}
-import filodb.memory.format.ZeroCopyUTF8String
-import filodb.memory.format.ZeroCopyUTF8String._
 import monix.reactive.Observable
 import org.apache.spark.SparkConf
 import org.scalatest.BeforeAndAfterAll
@@ -24,6 +16,17 @@ import org.scalatest.time.{Millis, Seconds, Span}
 import scala.concurrent.Await
 import scala.concurrent.duration.Duration
 
+import filodb.cassandra.DefaultFiloSessionProvider
+import filodb.cassandra.columnstore.CassandraColumnStore
+import filodb.core.GlobalConfig
+import filodb.core.binaryrecord2.RecordBuilder
+import filodb.core.downsample.OffHeapMemory
+import filodb.core.memstore.{TimeSeriesPartition, TimeSeriesShardStats}
+import filodb.core.metadata.{Dataset, Schema, Schemas}
+import filodb.core.store.{PartKeyRecord, StoreConfig}
+import filodb.memory.format.ZeroCopyUTF8String._
+import filodb.memory.format.{UnsafeUtils, ZeroCopyUTF8String}
+
 class PartitionKeysCopierSpec extends AnyFunSpec with Matchers with BeforeAndAfterAll with ScalaFutures {
   implicit val defaultPatience = PatienceConfig(timeout = Span(15, Seconds), interval = Span(250, Millis))
 
@@ -31,19 +34,12 @@ class PartitionKeysCopierSpec extends AnyFunSpec with Matchers with BeforeAndAft
 
   val configPath = "conf/timeseries-filodb-server.conf"
 
-  val sysConfig = GlobalConfig.systemConfig.getConfig("filodb")
-
-  val config = ConfigFactory.parseFile(new File(configPath)).getConfig("filodb").withFallback(sysConfig)
-
-  // TODO: change this!! how do we pick the right file path here? Or we read all of them?
-  val sourceConfigPath = config.getStringList("dataset-configs").get(0)
-  val shards = ConfigFactory.parseFile(new File(sourceConfigPath)).getInt("num-shards")
+  private val sysConfig = GlobalConfig.systemConfig.getConfig("filodb")
+  private val config = ConfigFactory.parseFile(new File(configPath)).getConfig("filodb").withFallback(sysConfig)
 
   lazy val session = new DefaultFiloSessionProvider(config.getConfig("cassandra")).session
   lazy val colStore = new CassandraColumnStore(config, s, session)
 
-  //  val lastSampleTime = 74373042000L
-  //  val pkUpdateHour = hour(lastSampleTime)
   var gauge1PartKeyBytes: Array[Byte] = _
   var gauge2PartKeyBytes: Array[Byte] = _
   var gauge3PartKeyBytes: Array[Byte] = _
@@ -56,23 +52,44 @@ class PartitionKeysCopierSpec extends AnyFunSpec with Matchers with BeforeAndAft
                 """.stripMargin))
   val offheapMem = new OffHeapMemory(Seq(Schemas.gauge, Schemas.promCounter, Schemas.promHistogram, Schemas.untyped),
     Map.empty, 100, rawDataStoreConfig)
-  val seriesTags1 = Map("_ws_".utf8 -> "my_ws1".utf8, "_ns_".utf8 -> "my_ns1".utf8)
-  val seriesTags2 = Map("_ws_".utf8 -> "my_ws2".utf8, "_ns_".utf8 -> "my_ns2".utf8)
-  val seriesTags3 = Map("_ws_".utf8 -> "my_ws3".utf8, "_ns_".utf8 -> "my_ns3".utf8)
 
-  val sourceDataset = Dataset("source", Schemas.gauge)
-  val targetDataset = Dataset("target", Schemas.gauge)
-
+  val datasetName = "prometheus"
+  val targetDatasetName = "buddy_prometheus"
+  val sourceDataset = Dataset(datasetName, Schemas.gauge)
+  val targetDataset = Dataset(targetDatasetName, Schemas.gauge)
   val shardStats = new TimeSeriesShardStats(sourceDataset.ref, -1)
 
-  def hour(millis: Long = System.currentTimeMillis()): Long = millis / 1000 / 60 / 60
+  val sparkConf = {
+    val conf = new SparkConf(loadDefaults = true)
+    conf.setMaster("local[2]")
+
+    conf.set("spark.filodb.partitionkeys.copier.source.configFile", configPath)
+    conf.set("spark.filodb.partitionkeys.copier.source.dataset", datasetName)
+
+    conf.set("spark.filodb.partitionkeys.copier.target.configFile", configPath)
+    conf.set("spark.filodb.partitionkeys.copier.target.dataset", targetDatasetName)
+
+    conf.set("spark.filodb.partitionkeys.copier.ingestionTimeStart", "2020-10-13T00:00:00Z")
+    conf.set("spark.filodb.partitionkeys.copier.ingestionTimeEnd", "2020-10-13T05:00:00Z")
+    conf.set("spark.filodb.partitionkeys.copier.diskTimeToLive", "7d")
+    conf
+  }
+
+  val numOfShards = PartitionKeysCopier.lookup(sparkConf).getShardNum
+
+  // Examples: 2019-10-20T12:34:56Z  or  2019-10-20T12:34:56-08:00
+  private def parseDateTime(str: String) = Instant.from(DateTimeFormatter.ISO_OFFSET_DATE_TIME.parse(str))
+
+  def getSeriesTags(workspace: String, namespace: String): Map[ZeroCopyUTF8String, ZeroCopyUTF8String] = {
+    Map("_ws_".utf8 -> workspace.utf8, "_ns_".utf8 -> namespace.utf8)
+  }
 
   override def beforeAll(): Unit = {
-    colStore.initialize(sourceDataset.ref, 1).futureValue
-    colStore.truncate(sourceDataset.ref, 1).futureValue
+    colStore.initialize(sourceDataset.ref, numOfShards).futureValue
+    colStore.truncate(sourceDataset.ref, numOfShards).futureValue
 
-    colStore.initialize(targetDataset.ref, 1).futureValue
-    colStore.truncate(targetDataset.ref, 1).futureValue
+    colStore.initialize(targetDataset.ref, numOfShards).futureValue
+    colStore.truncate(targetDataset.ref, numOfShards).futureValue
   }
 
   override def afterAll(): Unit = {
@@ -95,35 +112,25 @@ class PartitionKeysCopierSpec extends AnyFunSpec with Matchers with BeforeAndAft
       part
     }
 
-    gauge1PartKeyBytes = tsPartition(Schemas.gauge, "my_gauge1", seriesTags1).partKeyBytes
-    writePartKeys(PartKeyRecord(gauge1PartKeyBytes, 1507923801000L, Long.MaxValue, Some(150)), 0) // 2017
+    for (shard <- 0 until numOfShards) {
+      val ws: String = "my_ws_name_" + shard
+      val ns: String = "my_ns_id"
 
-    gauge2PartKeyBytes = tsPartition(Schemas.gauge, "my_gauge2", seriesTags2).partKeyBytes
-    writePartKeys(PartKeyRecord(gauge2PartKeyBytes, 1539459801000L, Long.MaxValue, Some(150)), 0) // 2018
+      gauge1PartKeyBytes = tsPartition(Schemas.gauge, "my_gauge1", getSeriesTags(ws + "1", ns + "1")).partKeyBytes
+      writePartKeys(PartKeyRecord(gauge1PartKeyBytes, 1507923801000L, Long.MaxValue, Some(150)), shard) // 2017
 
-    gauge3PartKeyBytes = tsPartition(Schemas.gauge, "my_gauge3", seriesTags3).partKeyBytes
-    writePartKeys(PartKeyRecord(gauge3PartKeyBytes, 1602554400000L, 1602561600000L, Some(150)), 0) // 2020-10-13 02:00-04:00 GMT
+      gauge2PartKeyBytes = tsPartition(Schemas.gauge, "my_gauge2", getSeriesTags(ws + "2", ns + "2")).partKeyBytes
+      writePartKeys(PartKeyRecord(gauge2PartKeyBytes, 1539459801000L, Long.MaxValue, Some(150)), shard) // 2018
 
-    gauge4PartKeyBytes = tsPartition(Schemas.gauge, "my_gauge4", seriesTags3).partKeyBytes
-    writePartKeys(PartKeyRecord(gauge4PartKeyBytes, 1602549000000L, 1602561600000L, Some(150)), 0) // 2020-10-13 00:30-04:00 GMT
+      gauge3PartKeyBytes = tsPartition(Schemas.gauge, "my_gauge3", getSeriesTags(ws + "3", ns + "3")).partKeyBytes
+      writePartKeys(PartKeyRecord(gauge3PartKeyBytes, 1602554400000L, 1602561600000L, Some(150)), shard) // 2020-10-13 02:00-04:00 GMT
+
+      gauge4PartKeyBytes = tsPartition(Schemas.gauge, "my_gauge4", getSeriesTags(ws + "4", ns + "4")).partKeyBytes
+      writePartKeys(PartKeyRecord(gauge4PartKeyBytes, 1602549000000L, 1602561600000L, Some(150)), shard) // 2020-10-13 00:30-04:00 GMT
+    }
   }
 
   it("should run a simple Spark job") {
-    // This test verifies that the configuration can be read and that Spark runs. A full test
-    // that verifies chunks are copied correctly is found in CassandraColumnStoreSpec.
-
-    val sparkConf = new SparkConf(loadDefaults = true)
-    sparkConf.setMaster("local[2]")
-
-    sparkConf.set("spark.filodb.partitionkeys.copier.source.configFile", configPath)
-    sparkConf.set("spark.filodb.partitionkeys.copier.source.dataset", "source")
-
-    sparkConf.set("spark.filodb.partitionkeys.copier.target.configFile", configPath)
-    sparkConf.set("spark.filodb.partitionkeys.copier.target.dataset", "target")
-
-    sparkConf.set("spark.filodb.partitionkeys.copier.ingestionTimeStart", "2020-10-13T00:00:00Z")
-    sparkConf.set("spark.filodb.partitionkeys.copier.ingestionTimeEnd", "2020-10-13T05:00:00Z")
-    sparkConf.set("spark.filodb.partitionkeys.copier.diskTimeToLive", "7d")
 
     PartitionKeysCopierMain.run(sparkConf).close()
 
@@ -132,19 +139,79 @@ class PartitionKeysCopierSpec extends AnyFunSpec with Matchers with BeforeAndAft
   }
 
   it("verify data written onto cassandra target table") {
-//    def partKeyBytes(pk: PartKeyRecord) : Array[Byte] = {
-//      pk.
-//    }
+    def getWorkspace(map: Map[String, String]): String = {
+      val ws: String = map.get("_ws_").get
+      ws
+    }
 
-    val partKeys = Await.result(colStore.scanPartKeys(targetDataset.ref, 0).toListL.runAsync,
+    def getNamespace(map: Map[String, String]): String = {
+      val ws: String = map.get("_ns_").get
+      ws
+    }
+
+    def getPartKeyMap(partKeyRecord: PartKeyRecord) : Map[String, String] = {
+      val pk = partKeyRecord.partKey
+      val pkPairs = Schemas.gauge.partKeySchema.toStringPairs(pk, UnsafeUtils.arayOffset)
+      val map = pkPairs.map(a => a._1 -> a._2).toMap
+      map
+    }
+
+    val startTime = parseDateTime(sparkConf.get("spark.filodb.partitionkeys.copier.ingestionTimeStart")).toEpochMilli()
+    val endTime = parseDateTime(sparkConf.get("spark.filodb.partitionkeys.copier.ingestionTimeEnd")).toEpochMilli()
+
+    for (shard <- 0 until numOfShards) {
+      val partKeyRecords = Await.result(colStore.scanPartKeys(targetDataset.ref, shard).toListL.runAsync, Duration(1, "minutes"))
+
+      // because there will be 2 records that meets the copier time period.
+      partKeyRecords.size shouldEqual 2
+
+      for (pkr <- partKeyRecords) {
+        // verify all the records fall in the copier time period.
+        pkr.startTime should be >= startTime
+        pkr.endTime should be <= endTime
+      }
+    }
+
+    // verify workspace/namespace names in shard=0.
+    val shard0 = 0
+    val partKeyRecordsShard0 = Await.result(colStore.scanPartKeys(targetDataset.ref, shard0).toListL.runAsync,
       Duration(1, "minutes"))
-    partKeys.size shouldEqual 2
+    partKeyRecordsShard0.size shouldEqual 2
+    for (pkr <- partKeyRecordsShard0) {
+      val map = getPartKeyMap(pkr)
 
+      // verify workspace/namespace value for "my_gauge3" metric
+      if ("my_gauge3".equals(map.get("_metric_").get)) {
+        getWorkspace(map) shouldEqual "my_ws_name_03"
+        getNamespace(map) shouldEqual "my_ns_id3"
+      }
 
+      // verify workspace/namespace value for "my_gauge4" metric
+      if ("my_gauge4".equals(map.get("_metric_").get)) {
+        getWorkspace(map) shouldEqual "my_ws_name_04"
+        getNamespace(map) shouldEqual "my_ns_id4"
+      }
+    }
 
-//    partKeys.map()
-    for(pk <- partKeys) {
+    // verify workspace/namespace names in shard=2.
+    val shard2 = 2
+    val partKeyRecordsShard2 = Await.result(colStore.scanPartKeys(targetDataset.ref, shard2).toListL.runAsync,
+      Duration(1, "minutes"))
+    partKeyRecordsShard2.size shouldEqual 2
+    for (pkr <- partKeyRecordsShard2) {
+      val map = getPartKeyMap(pkr)
 
+      // verify workspace/namespace value for "my_gauge3" metric
+      if ("my_gauge3".equals(map.get("_metric_").get)) {
+        getWorkspace(map) shouldEqual "my_ws_name_23"
+        getNamespace(map) shouldEqual "my_ns_id3"
+      }
+
+      // verify workspace/namespace value for "my_gauge4" metric
+      if ("my_gauge4".equals(map.get("_metric_").get)) {
+        getWorkspace(map) shouldEqual "my_ws_name_24"
+        getNamespace(map) shouldEqual "my_ns_id4"
+      }
     }
   }
 }
